@@ -65,6 +65,12 @@ def _ydl_cli_args(url: str) -> list[str]:
         # SABR-streamed combined formats (requires PO tokens). Audio-only
         # formats are nearly always available without auth tokens.
         "-f", "bestaudio/best",
+        # YouTube's bot-detection is more lenient on the Android and iOS
+        # player clients than on the web client (different auth flow, no
+        # PO-token requirement). Trying them first significantly raises the
+        # success rate from data-center IPs like Cloud Run. yt-dlp falls
+        # through to the next client if one is blocked.
+        "--extractor-args", "youtube:player_client=android,ios,web",
         "--user-agent", os.environ.get("YT_DLP_USER_AGENT", _DEFAULT_UA),
     ]
     cookies_file = _writable_cookies_path()
