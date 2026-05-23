@@ -8,6 +8,7 @@ from backend.agents import root
 from backend.config import get_settings
 from backend.ingestion import live_hls, recorded, transcript, youtube
 from backend.ingestion.chunker import cleanup_session
+from backend.ingestion.transcript import NoCaptionsError
 from backend.ingestion.youtube import IngestionError
 from backend.runtime.session_manager import Session
 from backend.schemas import IngestionMode, OverlayEvent, StreamKind
@@ -41,18 +42,38 @@ async def run(session: Session) -> None:
         await session.emit(OverlayEvent(event="session_ended", session_id=session.session_id))
         return
 
+    use_transcript = session.mode == IngestionMode.TRANSCRIPT
     try:
-        if session.mode == IngestionMode.TRANSCRIPT:
-            statements = transcript.stream_transcript(
-                session.youtube_url, session.session_id
-            )
-            await root.run_transcript_session(
-                session_id=session.session_id,
-                statements=statements,
-                out_queue=session.queue,
-                max_claims=settings.max_claims_per_session,
-            )
-        else:
+        if use_transcript:
+            try:
+                prepared = await transcript.prepare_statements(
+                    session.youtube_url, session.session_id
+                )
+            except NoCaptionsError as exc:
+                log.warning(
+                    "session %s caption fetch failed, falling back to audio: %s",
+                    session.session_id, exc,
+                )
+                await session.emit(
+                    OverlayEvent(
+                        event="error",
+                        session_id=session.session_id,
+                        message=f"{exc} Falling back to Audio mode.",
+                    )
+                )
+                use_transcript = False
+            else:
+                statements = transcript.stream_statements(
+                    prepared, session.session_id
+                )
+                await root.run_transcript_session(
+                    session_id=session.session_id,
+                    statements=statements,
+                    out_queue=session.queue,
+                    max_claims=settings.max_claims_per_session,
+                )
+
+        if not use_transcript:
             if session.kind == StreamKind.LIVE:
                 chunks = live_hls.stream_live(
                     session.youtube_url, session.session_id, settings.chunk_seconds

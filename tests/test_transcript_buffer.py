@@ -1,8 +1,23 @@
 """Sentence-buffering and VTT-parsing tests for transcript-mode ingestion."""
+import pytest
+
+from backend.ingestion import transcript
 from backend.ingestion.transcript import (
+    NoCaptionsError,
+    _cache_get,
+    _cache_put,
+    _classify_yt_dlp_error,
+    _clear_caption_cache,
     buffer_into_statements,
     parse_vtt,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_caption_cache():
+    _clear_caption_cache()
+    yield
+    _clear_caption_cache()
 
 
 def test_buffer_flushes_on_sentence_terminator():
@@ -110,3 +125,59 @@ def test_buffer_preserves_time_window():
     assert out[0][1] == 11.0
     assert out[1][0] == 11.0
     assert out[1][1] == 12.0
+
+
+def test_classify_rate_limit_error_is_actionable():
+    err = _classify_yt_dlp_error(
+        "ERROR: Unable to download video subtitles for 'en': "
+        "HTTP Error 429: Too Many Requests"
+    )
+    assert isinstance(err, NoCaptionsError)
+    assert "429" in str(err)
+    assert "Audio mode" in str(err)
+
+
+def test_classify_bot_wall_error_mentions_cookies():
+    err = _classify_yt_dlp_error(
+        "ERROR: Sign in to confirm you're not a bot. Use --cookies-from-browser..."
+    )
+    assert "cookies" in str(err).lower() or "YT_DLP_COOKIES" in str(err)
+
+
+def test_classify_unknown_error_passes_through():
+    err = _classify_yt_dlp_error("ERROR: Some other yt-dlp failure")
+    assert isinstance(err, NoCaptionsError)
+    assert "Some other yt-dlp failure" in str(err)
+
+
+def test_classify_truncates_long_stderr():
+    long_err = "X" * 1000
+    err = _classify_yt_dlp_error(long_err)
+    # Message should be bounded so we don't dump 1KB into the SSE stream.
+    assert len(str(err)) < 500
+
+
+def test_caption_cache_hit_returns_stored_cues():
+    cues = [(0.0, 1.0, "Hello.")]
+    _cache_put("https://example.com/abc", cues)
+    assert _cache_get("https://example.com/abc") == cues
+
+
+def test_caption_cache_miss_returns_none():
+    assert _cache_get("https://example.com/never-fetched") is None
+
+
+def test_caption_cache_eviction_respects_max(monkeypatch):
+    monkeypatch.setattr(transcript, "_CAPTION_CACHE_MAX_ENTRIES", 3)
+    for i in range(5):
+        _cache_put(f"url-{i}", [(0.0, 1.0, f"cue {i}")])
+    # Oldest two should have been evicted.
+    assert _cache_get("url-0") is None
+    assert _cache_get("url-1") is None
+    assert _cache_get("url-4") is not None
+
+
+def test_caption_cache_ttl_expires(monkeypatch):
+    monkeypatch.setattr(transcript, "_CAPTION_CACHE_TTL_SECONDS", 0.0)
+    _cache_put("url-stale", [(0.0, 1.0, "stale")])
+    assert _cache_get("url-stale") is None
