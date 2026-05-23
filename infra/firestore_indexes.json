@@ -1,0 +1,12 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "verdicts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "ts", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

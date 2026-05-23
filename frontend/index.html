@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Live Reality Fact-Check Overlay</title>
+  <link rel="stylesheet" href="/static/overlay.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>Live Reality Fact-Check</h1>
+    <form id="session-form">
+      <input id="url" type="url" placeholder="Paste a YouTube URL (recorded or live)" required />
+      <button type="submit">Start</button>
+      <button type="button" id="stop">Stop</button>
+    </form>
+    <div id="status" class="status idle">idle</div>
+  </header>
+
+  <main class="stage">
+    <div id="player-wrap">
+      <div id="player"></div>
+      <div id="overlay-layer"></div>
+    </div>
+
+    <aside id="claim-log">
+      <h2>Claims</h2>
+      <ul id="claim-list"></ul>
+    </aside>
+  </main>
+
+  <script src="https://www.youtube.com/iframe_api"></script>
+  <script src="/static/app.js" type="module"></script>
+</body>
+</html>
