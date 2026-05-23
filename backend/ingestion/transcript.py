@@ -14,7 +14,9 @@ import logging
 import os
 import re
 import tempfile
+import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -29,9 +31,43 @@ _SENTENCE_END = re.compile(r"[.!?]['\"\)\]]?\s*$")
 _MAX_BUFFER_SECONDS = 12.0
 _MAX_BUFFER_CHARS = 400
 
+# Per-process LRU cache of parsed cues, keyed on URL. Recorded videos'
+# captions are immutable, so a long TTL is fine; this is mainly here to
+# soak up YouTube's caption-endpoint 429s when a user re-tries the same URL.
+_CAPTION_CACHE_TTL_SECONDS = 3600.0
+_CAPTION_CACHE_MAX_ENTRIES = 100
+_caption_cache: OrderedDict[str, tuple[float, list[tuple[float, float, str]]]] = (
+    OrderedDict()
+)
+
 
 class NoCaptionsError(IngestionError):
     """Raised when no usable English caption track is available for the URL."""
+
+
+def _cache_get(url: str) -> list[tuple[float, float, str]] | None:
+    now = time.monotonic()
+    entry = _caption_cache.get(url)
+    if entry is None:
+        return None
+    ts, cues = entry
+    if now - ts > _CAPTION_CACHE_TTL_SECONDS:
+        _caption_cache.pop(url, None)
+        return None
+    _caption_cache.move_to_end(url)
+    return cues
+
+
+def _cache_put(url: str, cues: list[tuple[float, float, str]]) -> None:
+    _caption_cache[url] = (time.monotonic(), cues)
+    _caption_cache.move_to_end(url)
+    while len(_caption_cache) > _CAPTION_CACHE_MAX_ENTRIES:
+        _caption_cache.popitem(last=False)
+
+
+def _clear_caption_cache() -> None:
+    """Test helper: drop all cached captions."""
+    _caption_cache.clear()
 
 
 def _vtt_timestamp_to_seconds(s: str) -> float:
@@ -125,12 +161,38 @@ def buffer_into_statements(
     return out
 
 
+_RATE_LIMIT_RE = re.compile(r"\b429\b|too many requests", re.IGNORECASE)
+
+
+def _classify_yt_dlp_error(stderr: str) -> NoCaptionsError:
+    """Map a yt-dlp stderr blob to a user-facing NoCaptionsError."""
+    if "Sign in to confirm" in stderr or "bot" in stderr.lower():
+        return NoCaptionsError(
+            "YouTube is blocking this server's IP (bot check). "
+            "Mount a cookies.txt file and set YT_DLP_COOKIES to its path, "
+            "or switch to Audio mode."
+        )
+    if _RATE_LIMIT_RE.search(stderr):
+        return NoCaptionsError(
+            "YouTube rate-limited the caption endpoint (HTTP 429). "
+            "Wait a minute and retry, or switch to Audio mode."
+        )
+    return NoCaptionsError(f"yt-dlp could not fetch captions: {stderr[:300]}")
+
+
 async def fetch_captions(url: str, session_id: str) -> list[tuple[float, float, str]]:
     """Download and parse the best-available English caption track for ``url``.
 
-    Tries author-uploaded subs first, then auto-generated. Raises
-    :class:`NoCaptionsError` if neither is present.
+    Results are cached per-URL for ``_CAPTION_CACHE_TTL_SECONDS``, so a retry
+    after a transient 429 (or a second session on the same video) doesn't
+    re-hit YouTube. Raises :class:`NoCaptionsError` on bot wall, rate limit,
+    or genuinely missing captions.
     """
+    cached = _cache_get(url)
+    if cached is not None:
+        log.info("caption cache hit for %s (%d cues)", url[:120], len(cached))
+        return cached
+
     with tempfile.TemporaryDirectory(prefix=f"factcheck-subs-{session_id}-") as tmpdir:
         out_template = str(Path(tmpdir) / "subs.%(ext)s")
         args = [
@@ -143,7 +205,12 @@ async def fetch_captions(url: str, session_id: str) -> list[tuple[float, float, 
             "--sub-langs", "en.*,en",
             "--sub-format", "vtt/best",
             "--no-playlist",
-            "--retries", "3",
+            # Backoff for transient HTTP failures (esp. 429s) from the
+            # timedtext endpoint. `exp=2:8` caps at 8s, so total wait across
+            # 4 retries is 2+4+8+8 = 22s before we give up and let the runner
+            # fall back to audio mode.
+            "--retries", "4",
+            "--retry-sleep", "http:exp=2:8",
             "-o", out_template,
         ]
         cookies_file = os.environ.get("YT_DLP_COOKIES")
@@ -160,13 +227,7 @@ async def fetch_captions(url: str, session_id: str) -> list[tuple[float, float, 
         )
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
-            err = stderr.decode("utf-8", errors="replace").strip()
-            if "Sign in to confirm" in err or "bot" in err.lower():
-                raise NoCaptionsError(
-                    "YouTube is blocking this server's IP (bot check). "
-                    "Mount a cookies.txt file and set YT_DLP_COOKIES to its path."
-                )
-            raise NoCaptionsError(f"yt-dlp could not fetch captions: {err[:300]}")
+            raise _classify_yt_dlp_error(stderr.decode("utf-8", errors="replace").strip())
 
         vtt_files = sorted(Path(tmpdir).glob("*.vtt"))
         if not vtt_files:
@@ -180,26 +241,30 @@ async def fetch_captions(url: str, session_id: str) -> list[tuple[float, float, 
         cues = parse_vtt(content)
         if not cues:
             raise NoCaptionsError("Caption file was empty after parsing.")
+        _cache_put(url, cues)
         return cues
 
 
-async def stream_transcript(
-    url: str,
-    session_id: str,
-    pace_seconds: float = 0.0,
-) -> AsyncIterator[tuple[Chunk, str]]:
-    """Yield sentence-buffered transcript chunks for ``url``.
-
-    ``pace_seconds`` adds a small inter-statement delay so SSE events arrive
-    progressively rather than as one big batch. Set to 0 for instant fan-out.
-    """
+async def prepare_statements(
+    url: str, session_id: str
+) -> list[tuple[float, float, str]]:
+    """Fetch + sentence-buffer captions. Raises before any streaming starts,
+    so the caller can fall back to audio mode without partial output."""
     cues = await fetch_captions(url, session_id)
     statements = buffer_into_statements(cues)
     log.info(
         "transcript: %d cues → %d statements for session %s",
         len(cues), len(statements), session_id,
     )
+    return statements
 
+
+async def stream_statements(
+    statements: list[tuple[float, float, str]],
+    session_id: str,
+    pace_seconds: float = 0.0,
+) -> AsyncIterator[tuple[Chunk, str]]:
+    """Yield prepared statements as ``(Chunk, text)`` tuples for the runner."""
     for t_start, t_end, text in statements:
         chunk = Chunk(
             chunk_id=f"{session_id}:{uuid.uuid4().hex[:8]}",
@@ -211,3 +276,18 @@ async def stream_transcript(
         yield chunk, text
         if pace_seconds > 0:
             await asyncio.sleep(pace_seconds)
+
+
+async def stream_transcript(
+    url: str,
+    session_id: str,
+    pace_seconds: float = 0.0,
+) -> AsyncIterator[tuple[Chunk, str]]:
+    """Combined prepare + stream — kept for direct callers / tests.
+
+    The runner uses :func:`prepare_statements` + :func:`stream_statements`
+    separately so it can fall back to audio mode on caption failure.
+    """
+    statements = await prepare_statements(url, session_id)
+    async for item in stream_statements(statements, session_id, pace_seconds):
+        yield item
