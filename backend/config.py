@@ -17,6 +17,12 @@ class Settings(BaseSettings):
     chunk_seconds: int = 5
     dedupe_ttl_seconds: int = 60
     max_claims_per_session: int = 50
+    # Transcript mode verifies every statement of the full transcript, so it
+    # needs a much higher ceiling than the filtered claim modes.
+    max_statements_per_session: int = 800
+    # Cap concurrent evidence/verdict pipelines so a long transcript doesn't
+    # fan out hundreds of grounded Gemini calls at once and trip rate limits.
+    max_concurrent_checks: int = 5
 
     firestore_collection: str = "verdicts"
     pubsub_chunk_topic: str = "fact-check-chunks"

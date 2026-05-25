@@ -12,8 +12,8 @@
     <form id="session-form">
       <input id="url" type="url" placeholder="Paste a YouTube URL (recorded or live)" required />
       <select id="mode" title="How the video gets processed">
+        <option value="transcript">Full transcript (check every line)</option>
         <option value="audio">Audio fragments</option>
-        <option value="transcript">Captions (complete sentences)</option>
         <option value="video">Direct video (Gemini fetches)</option>
       </select>
       <button type="submit">Start</button>
