@@ -324,12 +324,14 @@ async def run_video_session(
 ) -> None:
     """Drive the pipeline for direct-video mode.
 
-    Gemini receives the YouTube URL directly and returns all check-worthy
-    claims (with timestamps) in one shot. Each claim then fans out through
-    the existing dedupe → search → verdict pipeline.
+    Gemini receives the YouTube URL directly and returns the full transcript
+    (every statement, with timestamps) in one shot. Each statement then fans
+    out through the existing dedupe → search → verdict pipeline, with bounded
+    concurrency so a long transcript doesn't trip rate limits.
     """
     deduper = ClaimDeduper()
     cache = VerdictCache()
+    semaphore = asyncio.Semaphore(get_settings().max_concurrent_checks)
     background_tasks: list[asyncio.Task] = []
 
     try:
@@ -337,7 +339,7 @@ async def run_video_session(
             youtube_url, session_id
         )
         log.info(
-            "video mode: extracted %d claims for session %s",
+            "video mode: extracted %d statements for session %s",
             len(claims), session_id,
         )
         _dispatch_claims(
@@ -348,6 +350,7 @@ async def run_video_session(
             out_queue=out_queue,
             max_claims_remaining=max_claims,
             background_tasks=background_tasks,
+            semaphore=semaphore,
         )
     except Exception as exc:
         log.exception("session %s video mode failed: %s", session_id, exc)

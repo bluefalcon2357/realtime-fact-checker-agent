@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     # Cap concurrent evidence/verdict pipelines so a long transcript doesn't
     # fan out hundreds of grounded Gemini calls at once and trip rate limits.
     max_concurrent_checks: int = 5
+    # Direct-video mode returns the whole transcript in one JSON response; give
+    # it room so long videos aren't truncated mid-transcript.
+    video_max_output_tokens: int = 8192
 
     firestore_collection: str = "verdicts"
     pubsub_chunk_topic: str = "fact-check-chunks"

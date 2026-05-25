@@ -67,7 +67,7 @@ async def run(session: Session) -> None:
                     session_id=session.session_id,
                     youtube_url=session.youtube_url,
                     out_queue=session.queue,
-                    max_claims=settings.max_claims_per_session,
+                    max_claims=settings.max_statements_per_session,
                 )
 
         elif use_transcript:
